@@ -10,7 +10,7 @@
 
 **Use Cases**
 - Spatial literacy and computational thinking workshops.
-- Local SDG indicators (population estimation, [BVPC](https://www.frontiersin.org/journals/sustainable-cities/articles/10.3389/frsc.2020.00037/full), rooftop solar potential).
+- Local (Tier 3) SDG indicators (population estimation, [BVPC](https://www.frontiersin.org/journals/sustainable-cities/articles/10.3389/frsc.2020.00037/full), rooftop solar potential).
 - Low-resource or offline-only environments.
 
 **What it is NOT**
