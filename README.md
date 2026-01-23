@@ -1,6 +1,6 @@
 # *geo3DLite* (QGIS)
 
-*geo3DLite* is a dependency-free, educational variant of [*geo3D*](https://github.com/AdrianKriger/geo3D) designed to run entirely within [QGIS](https://qgis.org). It focuses on spatial reasoning and interactive exploration at the village and suburb scale.
+*geo3DLite* is a dependency-free, variant of [*geo3D*](https://github.com/AdrianKriger/geo3D) designed to run entirely within [QGIS](https://qgis.org). It focuses on spatial reasoning and interactive exploration at the village and suburb scale.
 
 **Core Characteristics**
 - QGIS-Native: No Conda, no Docker, nor external Python libraries required.
