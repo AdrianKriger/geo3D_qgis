@@ -5,12 +5,12 @@
 **Core Characteristics**
 - QGIS-Native: No Conda, no Docker, nor external Python libraries required.
 - Interactive-Only: Designed for exploratory analysis and workshops, not production.
-- Local, Place-based Learning: Optimized for villages and neighbourhoods.
+- Local, Place-based Learning: Optimized for communities.
 - Didactic: Prioritizes transparency and learning over automated production.
 
 **Use Cases**
 - Spatial literacy and computational thinking workshops.
-- Local SDG indicators (density, rooftop potential, access).
+- Local SDG indicators (population estimation, [BVPC](https://www.frontiersin.org/journals/sustainable-cities/articles/10.3389/frsc.2020.00037/full), rooftop solar potential).
 - Low-resource or offline-only environments.
 
 **What it is NOT**
