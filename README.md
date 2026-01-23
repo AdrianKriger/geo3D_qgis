@@ -1,4 +1,4 @@
-# *geo3D*_qgis
+# *geo3DLite* (QGIS)
 3D City Models &amp; Spatial Data Science for Geography and Sustainable Development Education in QGIS
 
 To execute these notebooks within [QGIS](https://qgis.org); you will need to have the [opengeos](https://github.com/opengeos) [QGIS Notebook Plugin](https://plugins.qgis.org/plugins/qgis_notebook/) installed.
