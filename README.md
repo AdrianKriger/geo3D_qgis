@@ -14,7 +14,7 @@
 - Low-resource or offline-only environments.
 
 **What it is NOT**
-*geo3DLite* is not a tool for generating topologically correct, semantially rich LoD1+ City Models. For simulation ready (wind comfort factor, energy demand, etc.) models, you are welcome to [*geo3D*](https://github.com/AdrianKriger/geo3D)
+*geo3DLite* is not a tool for generating topologically correct, semantially rich LoD1 City Models. For simulation ready (wind comfort factor, energy demand, etc.) models, you are welcome to [*geo3D*](https://github.com/AdrianKriger/geo3D)
 
 **Requirements**
 - QGIS (Current LTR recommended) with the [opengeos](https://github.com/opengeos) [QGIS Notebook Plugin](https://plugins.qgis.org/plugins/qgis_notebook/) installed.
