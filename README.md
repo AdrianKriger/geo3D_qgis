@@ -13,7 +13,7 @@
 - Local (Tier 3) SDG indicators (population estimation, [BVPC](https://www.frontiersin.org/journals/sustainable-cities/articles/10.3389/frsc.2020.00037/full), rooftop solar potential).
 - Low-resource or offline-only environments.
 
-**What it is NOT**
+**What it is NOT.**
 *geo3DLite* is not a tool for generating topologically correct, semantially rich LoD1 City Models. For simulation ready (wind comfort factor, energy demand, etc.) models, you are welcome to [*geo3D*](https://github.com/AdrianKriger/geo3D)
 
 **Requirements**
