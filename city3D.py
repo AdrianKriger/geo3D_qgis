@@ -5,11 +5,16 @@ import os
 import json
 import processing
 from urllib.parse import quote
+import re
+import numpy as np
+import pandas as pd
+import geopandas as gpd
 
 from qgis.core import (
     QgsField, QgsProject, QgsDistanceArea, QgsCoordinateTransform, QgsFeatureRequest,
     QgsCoordinateReferenceSystem, QgsGeometry, QgsVariantUtils, QgsVectorLayer, QgsVectorFileWriter,
-    QgsLineSymbol, QgsSingleSymbolRenderer, QgsMapLayer, QgsCoordinateTransformContext
+    QgsLineSymbol, QgsSingleSymbolRenderer, QgsMapLayer, QgsCoordinateTransformContext,
+    NULL, QgsField
 )
 from qgis.PyQt.QtCore import QEventLoop, QUrl
 from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -19,6 +24,7 @@ from PyQt5.QtCore import QVariant
 
 from pyproj import CRS
 
+from osgeo import gdal, ogr, osr
 
 def _remove_layer_by_name(name):
     """Finds and removes any existing layer with the same name to prevent duplicates."""
@@ -262,6 +268,207 @@ def process3D(layer):
         return layer
     return None
 
+def extract_bndrs(input_pbf, focus, zoom=True):
+    gdal.UseExceptions()
+    
+    layer_name = f'aoi_{focus}'
+    boundary_name = focus
+    geojson_vsimem = "/vsimem/temp_boundary.geojson"
+
+    place_types = ["neighbourhood", "suburb", "quarter", "borough", "village", "town", "city"]
+    amenity_list = ["university", "research_institute"]
+
+    def _run_gdal_translate(where_clause):
+        try:
+            gdal.VectorTranslate(
+                geojson_vsimem,
+                input_pbf,
+                format="GeoJSON",
+                layers=["multipolygons"],
+                options=["-where", where_clause, "-makevalid"]
+            )
+            
+            # Load the temporary OGR layer
+            temp_layer = QgsVectorLayer(geojson_vsimem, "temp", "ogr")
+            
+            if temp_layer.isValid() and temp_layer.featureCount() > 0:
+                # IMPORTANT: Copy features to a permanent Memory Layer
+                # This prevents the layer from disappearing when vsimem is unlinked
+                mem_layer = temp_layer.materialize(QgsFeatureRequest())
+                mem_layer.setName(layer_name)
+                return mem_layer
+        except Exception as e:
+            print(f"Error during extraction: {e}")
+            return None
+        finally:
+            if gdal.VSIStatL(geojson_vsimem):
+                gdal.Unlink(geojson_vsimem)
+        return None
+
+    _remove_layer_by_name(layer_name)
+
+    # Strategy 1: Places
+    place_filter = " OR ".join([f"place = '{p}'" for p in place_types])
+    where_place = f"name = '{boundary_name}' AND ({place_filter})"
+    final = _run_gdal_translate(where_place)
+
+    # Strategy 2: Amenities
+    if final is None:
+        amenity_filter = " OR ".join([f"amenity = '{a}'" for a in amenity_list])
+        where_amenity = f"name = '{boundary_name}' AND ({amenity_filter})"
+        final = _run_gdal_translate(where_amenity)
+
+    if final is None:
+        raise RuntimeError(f"No boundary found for '{boundary_name}'")
+
+    # Finalize
+    QgsProject.instance().addMapLayer(final)
+
+    if zoom:
+        from qgis.utils import iface
+        iface.setActiveLayer(final)
+        # Ensure the canvas refreshes
+        iface.mapCanvas().setExtent(final.extent())
+        iface.mapCanvas().refresh()
+
+    return final
+
+def osm_key_to_field(key):
+    return (
+        key.replace(":", "_")
+           .replace("-", "_")
+           .lower()
+    )
+
+def process_osm_tags_and_ids(layer):
+    if not layer:
+        return None
+
+    layer.startEditing()
+    pr = layer.dataProvider()
+
+    fields = layer.fields()
+    field_names = {f.name() for f in fields}
+
+    # Regex for "key"=>"value"
+    tag_pattern = re.compile(r'"(.*?)"=>"(.*?)"')
+
+    # ---- discover missing OSM keys ----
+    missing_keys = set()
+
+    for f in layer.getFeatures():
+        tags = f['other_tags']
+        if not tags:
+            continue
+
+        for k, v in tag_pattern.findall(tags):
+            if k not in field_names:
+                missing_keys.add(k)
+
+    # ---- add missing fields (with colons preserved) ----
+    if missing_keys:
+        pr.addAttributes(
+            [QgsField(k, QVariant.String) for k in sorted(missing_keys)]
+        )
+        layer.updateFields()
+        fields = layer.fields()
+
+    # ---- populate fields ----
+    for f in layer.getFeatures():
+        attrs = {}
+        tags = f['other_tags']
+
+        if tags:
+            for k, v in tag_pattern.findall(tags):
+                idx = fields.indexFromName(k)
+                if idx != -1:
+                    # only fill if empty
+                    if f[k] in (None, "", NULL):
+                        attrs[idx] = v
+
+        # ---- osm_id fallback (safe) ----
+        if 'osm_id' in field_names and 'osm_way_id' in field_names:
+            if not f['osm_id']:
+                idx = fields.indexFromName('osm_id')
+                attrs[idx] = f['osm_way_id']
+
+        if attrs:
+            layer.changeAttributeValues(f.id(), attrs)
+
+    layer.commitChanges()
+    return layer
+
+def extract_blds(input_pbf, focus, aoi_layer):
+    """
+    Extracts buildings within the bounding box, then clips them 
+    to the irregular geometry of the aoi_layer.
+    """
+    gdal.UseExceptions()
+
+    layer_name = f"Buildings_{focus}"
+    geojson_vsimem = "/vsimem/temp_buildings.geojson"
+    
+    # 1. Get extent for the initial GDAL harvesting (fast)
+    extent = aoi_layer.extent()
+    minx, miny = extent.xMinimum(), extent.yMinimum()
+    maxx, maxy = extent.xMaximum(), extent.yMaximum()
+
+    def _run_gdal_translate():
+        try:
+            gdal.VectorTranslate(
+                geojson_vsimem,
+                input_pbf,
+                format="GeoJSON",
+                layers=["multipolygons"],
+                options=[
+                    "-where", "building IS NOT NULL", 
+                    "-makevalid", 
+                    "-spat", str(minx), str(miny), str(maxx), str(maxy)
+                ]
+            )
+            
+            temp_layer = QgsVectorLayer(geojson_vsimem, "raw_harvest", "ogr")
+            
+            if temp_layer.isValid() and temp_layer.featureCount() > 0:
+                # 2. Clip the harvested buildings to the irregular AOI
+                # This removes buildings in the "corners" of the bounding box
+                clipped_result = processing.run(
+                    "native:clip",
+                    {
+                        'INPUT': temp_layer,
+                        'OVERLAY': aoi_layer,
+                        'OUTPUT': 'memory:'
+                    }
+                )
+                
+                final_layer = clipped_result['OUTPUT']
+                final_layer.setName(layer_name)
+                return final_layer
+                
+        except Exception as e:
+            print(f"Error during building extraction/clip: {e}")
+            return None
+        finally:
+            if gdal.VSIStatL(geojson_vsimem):
+                gdal.Unlink(geojson_vsimem)
+        return None
+
+    # ---- clean up existing layer to prevent duplicates ----
+    _remove_layer_by_name(layer_name)
+
+    # ---- Execute extraction and clipping ----
+    final_blds = _run_gdal_translate()
+    final_blds = process_osm_tags_and_ids(final_blds)
+
+    if final_blds is None or final_blds.featureCount() == 0:
+        print(f"No buildings found inside the irregular AOI for '{focus}'.")
+        return None
+
+    # ---- add to QGIS ----
+    QgsProject.instance().addMapLayer(final_blds)
+
+    return final_blds
+
 def q_farmland(large, focus):
     """Harvest landuse=farmland and add to project."""
     name = f"Farmland_{focus}"
@@ -364,449 +571,6 @@ def layer_to_geojson_dict(layer):
     os.remove(temp_path)
     return data
 
-#def create_3Dviz(result_dir, buildings_layer, roads_layer=None):
-#def create_city_viz(buildings_layer, roads_layer=None, green_layer=None):
-
-    html_path = os.path.join(result_dir, "interactiveOnly.html")
-    #html_path = "/result/interactiveOnly.html"
-    
-    # Convert layers to Data
-    building_data = layer_to_geojson_dict(buildings_layer)
-    road_data = layer_to_geojson_dict(roads_layer) if roads_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-    green_data = layer_to_geojson_dict(green_layer) if green_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-
-    # --------------------------------------------------
-    # 3. MAP CENTRE FROM QGIS EXTENT
-    # --------------------------------------------------
-    extent = buildings_layer.extent()
-    center_coords = [
-        (extent.xMinimum() + extent.xMaximum()) / 2,
-        (extent.yMinimum() + extent.yMaximum()) / 2
-    ]
-
-    # --------------------------------------------------
-    # 4. HTML + MAPLIBRE
-    # --------------------------------------------------
-    html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8" />
-    <title>geo3D – Interactive City</title>
-
-    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-
-    <style>
-        body {{
-            margin: 0;
-            padding: 0;
-            font-family: system-ui, sans-serif;
-        }}
-        #map {{
-            position: absolute;
-            top: 0;
-            bottom: 0;
-            width: 100%;
-        }}
-        .maplibregl-popup {{
-            max-width: 320px;
-        }}
-        .popup-content {{
-            font-size: 13px;
-            line-height: 1.45;
-        }}
-    </style>
-</head>
-
-<body>
-<div id="map"></div>
-
-<script>
-const map = new maplibregl.Map({{
-    container: 'map',
-    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-    center: {json.dumps(center_coords)},
-    zoom: 16,
-    pitch: 60,
-    bearing: -15,
-    antialias: true
-}});
-
-// Enable rotate + pitch
-map.addControl(new maplibregl.NavigationControl({{
-    visualizePitch: true
-}}), 'top-right');
-
-map.on('load', () => {{
-
-    // -----------------------------
-    // GREEN SPACES
-    // -----------------------------
-    map.addSource('green', {{
-        type: 'geojson',
-        data: {json.dumps(green_data)}
-    }});
-
-    map.addLayer({{
-        id: 'green-layer',
-        type: 'fill',
-        source: 'green',
-        paint: {{
-            'fill-color': '#2e7d32',
-            'fill-opacity': 0.4
-        }}
-    }});
-
-    // -----------------------------
-    // ROADS
-    // -----------------------------
-    map.addSource('roads', {{
-        type: 'geojson',
-        data: {json.dumps(road_data)}
-    }});
-
-    map.addLayer({{
-        id: 'roads-layer',
-        type: 'line',
-        source: 'roads',
-        paint: {{
-            'line-color': '#555',
-            'line-width': 1.5
-        }}
-    }});
-
-    // -----------------------------
-    // BUILDINGS (3D)
-    // -----------------------------
-    map.addSource('buildings', {{
-        type: 'geojson',
-        data: {json.dumps(building_data)}
-    }});
-
-    map.addLayer({{
-        id: '3d-buildings',
-        type: 'fill-extrusion',
-        source: 'buildings',
-        paint: {{
-            'fill-extrusion-color': [
-                'case',
-                ['has', 'fill_color'],
-                [
-                    'rgba',
-                    ['at', 0, ['get', 'fill_color']],
-                    ['at', 1, ['get', 'fill_color']],
-                    ['at', 2, ['get', 'fill_color']],
-                    1
-                ],
-                '#aaaaaa'
-            ],
-            'fill-extrusion-height': [
-                'coalesce',
-                ['to-number', ['get', 'building_height']],
-                10
-            ],
-            'fill-extrusion-base': [
-                'coalesce',
-                ['to-number', ['get', 'ground_height']],
-                0
-            ],
-            'fill-extrusion-opacity': 0.65
-        }}
-    }});
-
-    // -----------------------------
-    // CLICK POPUPS
-    // -----------------------------
-    map.on('click', '3d-buildings', (e) => {{
-        const p = e.features[0].properties;
-
-        const html = `
-            <div class="popup-content">
-                <strong>Building:</strong> ${'{'}p.building || 'N/A'{'}'}<br><hr>
-                <strong>Address:</strong> ${'{'}p.address || 'N/A'{'}'}<br>
-                <strong>Plus Code:</strong> ${'{'}p.plus_code || 'N/A'{'}'}<br>
-                <strong>Height:</strong> ${'{'}p.building_height || 0{'}'} m
-            </div>
-        `;
-
-        new maplibregl.Popup()
-            .setLngLat(e.lngLat)
-            .setHTML(html)
-            .addTo(map);
-    }});
-
-    map.on('mouseenter', '3d-buildings', () => {{
-        map.getCanvas().style.cursor = 'pointer';
-    }});
-
-    map.on('mouseleave', '3d-buildings', () => {{
-        map.getCanvas().style.cursor = '';
-    }});
-    }});
-    </script>
-    </body>
-    </html>
-    """
-
-    # --------------------------------------------------
-    # 5. WRITE FILE
-    # --------------------------------------------------
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-#def create_3Dviz(result_dir, buildings_layer, farmland_layer=None, green_layer=None, water_layer=None, bus_layer=None):
-    html_path = os.path.join(result_dir, "interactiveOnly.html")
-    
-    # 1. Convert layers to Data
-    building_data = layer_to_geojson_dict(buildings_layer)
-    green_data = layer_to_geojson_dict(green_layer) if green_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-    farmland_data = layer_to_geojson_dict(farmland_layer) if farmland_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-    water_data = layer_to_geojson_dict(water_layer) if water_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-    bus_data = layer_to_geojson_dict(bus_layer) if bus_layer else {
-        "type": "FeatureCollection", "features": []
-    }
-
-    # --------------------------------------------------
-    # 3. MAP CENTRE FROM QGIS EXTENT
-    # --------------------------------------------------
-    extent = buildings_layer.extent()
-    center_coords = [
-        (extent.xMinimum() + extent.xMaximum()) / 2,
-        (extent.yMinimum() + extent.yMaximum()) / 2
-    ]
-
-    # --------------------------------------------------
-    # 4. HTML + MAPLIBRE
-    # --------------------------------------------------
-    html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8" />
-    <title>geo3D – Interactive City</title>
-
-    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-
-    <style>
-        body {{
-            margin: 0;
-            padding: 0;
-            font-family: system-ui, sans-serif;
-        }}
-        #map {{
-            position: absolute;
-            top: 0;
-            bottom: 0;
-            width: 100%;
-        }}
-        .maplibregl-popup {{
-            max-width: 320px;
-        }}
-        .popup-content {{
-            font-size: 13px;
-            line-height: 1.45;
-        }}
-    </style>
-</head>
-
-<body>
-<div id="map"></div>
-
-<script>
-const map = new maplibregl.Map({{
-    container: 'map',
-    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-    center: {json.dumps(center_coords)},
-    zoom: 16,
-    pitch: 60,
-    bearing: -15,
-    antialias: true
-}});
-
-// Enable rotate + pitch
-map.addControl(new maplibregl.NavigationControl({{
-    visualizePitch: true
-}}), 'top-right');
-
-map.on('load', () => {{
-
-    // -----------------------------
-    // WATER
-    // -----------------------------
-    map.addSource('water', {{
-        type: 'geojson',
-        data: {json.dumps(water_data)}
-    }});
-
-    map.addLayer({{
-        id: 'water-layer',
-        type: 'fill',
-        source: 'water',
-        paint: {{
-            'fill-color': '#01579b',
-            'fill-opacity': 0.5
-        }}
-    }});
-
-    // -----------------------------
-    // FARMLAND
-    // -----------------------------
-    map.addSource('farmland', {{
-        type: 'geojson',
-        data: {json.dumps(farmland_data)}
-    }});
-
-    map.addLayer({{
-        id: 'farmland-layer',
-        type: 'fill',
-        source: 'farmland',
-        paint: {{
-            'fill-color': '#3e2723',
-            'fill-opacity': 0.3
-        }}
-    }});
-
-    // -----------------------------
-    // GREEN SPACES
-    // -----------------------------
-    map.addSource('green', {{
-        type: 'geojson',
-        data: {json.dumps(green_data)}
-    }});
-
-    map.addLayer({{
-        id: 'green-layer',
-        type: 'fill',
-        source: 'green',
-        paint: {{
-            'fill-color': '#66bb6a',
-            'fill-opacity': 0.7
-        }}
-    }});
-
-    // -----------------------------
-    // BUS ROUTES (BRT)
-    // -----------------------------
-    map.addSource('bus', {{
-        type: 'geojson',
-        data: {json.dumps(bus_data)}
-    }});
-
-    map.addLayer({{
-        id: 'bus-layer',
-        type: 'line',
-        source: 'bus',
-        layout: {{
-            'line-join': 'round',
-            'line-cap': 'round'
-        }},
-        paint: {{
-            'line-color': [
-                'case',
-                ['has', 'colour'],
-                [
-                    'rgb',
-                    ['at', 0, ['get', 'colour']],
-                    ['at', 1, ['get', 'colour']],
-                    ['at', 2, ['get', 'colour']]
-                ],
-                '#FF0000' // Fallback Red if no colour column exists
-            ],
-            'line-width': 4,
-            'line-opacity': 0.9
-        }}
-    }});
-
-    // -----------------------------
-    // BUILDINGS (3D)
-    // -----------------------------
-    map.addSource('buildings', {{
-        type: 'geojson',
-        data: {json.dumps(building_data)}
-    }});
-
-    map.addLayer({{
-        id: '3d-buildings',
-        type: 'fill-extrusion',
-        source: 'buildings',
-        paint: {{
-            'fill-extrusion-color': [
-                'case',
-                ['has', 'fill_color'],
-                [
-                    'rgba',
-                    ['at', 0, ['get', 'fill_color']],
-                    ['at', 1, ['get', 'fill_color']],
-                    ['at', 2, ['get', 'fill_color']],
-                    1
-                ],
-                '#aaaaaa'
-            ],
-            'fill-extrusion-height': [
-                'coalesce',
-                ['to-number', ['get', 'building_height']],
-                10
-            ],
-            'fill-extrusion-base': [
-                'coalesce',
-                ['to-number', ['get', 'ground_height']],
-                0
-            ],
-            'fill-extrusion-opacity': 0.65
-        }}
-    }});
-
-    // -----------------------------
-    // CLICK POPUPS
-    // -----------------------------
-    map.on('click', '3d-buildings', (e) => {{
-        const p = e.features[0].properties;
-
-        const html = `
-            <div class="popup-content">
-                <strong>Building:</strong> ${'{'}p.building || 'N/A'{'}'}<br><hr>
-                <strong>Address:</strong> ${'{'}p.address || 'N/A'{'}'}<br>
-                <strong>Plus Code:</strong> ${'{'}p.plus_code || 'N/A'{'}'}<br>
-                <strong>Height:</strong> ${'{'}p.building_height || 0{'}'} m
-            </div>
-        `;
-
-        new maplibregl.Popup()
-            .setLngLat(e.lngLat)
-            .setHTML(html)
-            .addTo(map);
-    }});
-
-    map.on('mouseenter', '3d-buildings', () => {{
-        map.getCanvas().style.cursor = 'pointer';
-    }});
-
-    map.on('mouseleave', '3d-buildings', () => {{
-        map.getCanvas().style.cursor = '';
-    }});
-    }});
-    </script>
-    </body>
-    </html>
-    """
-
-    # --------------------------------------------------
-    # 5. WRITE FILE
-    # --------------------------------------------------
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
 
 def create_3Dviz(result_dir, buildings_layer, farmland_layer=None, green_layer=None, water_layer=None, bus_layer=None):
     html_path = os.path.join(result_dir, "interactiveOnly.html")
@@ -976,30 +740,235 @@ def q_solar(large, focus):
     QgsProject.instance().addMapLayer(final)
     return final
 
+def read_vsimem_geojson(vsimem_path):
+    """
+    Read a GDAL /vsimem GeoJSON into a standard GeoPandas GeoDataFrame.
+    """
+    gdf = gpd.read_file(vsimem_path)
+    gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+    return gdf
+
+def _harvestSolar(input_pbf, aoi_layer, epsg):
+    gdal.UseExceptions()
+    gdal.SetConfigOption("OGR_GEOMETRY_ACCEPT_UNCLOSED_RING", "NO")
+    gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
+
+    sql_where_solar_generator = """
+        other_tags LIKE '%"power"=>"generator"%'
+        AND other_tags LIKE '%"generator:source"=>"solar"%'
+    """
+    #- get extent for the initial GDAL harvesting (fast)
+    extent = aoi_layer.extent()
+    minx, miny = extent.xMinimum(), extent.yMinimum()
+    maxx, maxy = extent.xMaximum(), extent.yMaximum()
+    
+    all_solar_gdfs = []
+
+    # --- 1. multipolygons ---
+    geojson_poly = "/vsimem/solar_multipolygons.geojson"
+
+    gdal.VectorTranslate(
+        geojson_poly,
+        input_pbf,
+        format="GeoJSON",
+        layers=["multipolygons"],
+        options=[
+            "-where", sql_where_solar_generator,
+            "-makevalid",
+            "-spat", str(minx), str(miny), str(maxx), str(maxy),
+        ]
+    )
+
+    gdf_poly = read_vsimem_geojson(geojson_poly)
+    if not gdf_poly.empty:
+        all_solar_gdfs.append(gdf_poly)
+
+    # --- 2. lines (closed ways as polygons) ---
+    geojson_lines = "/vsimem/solar_lines.geojson"
+
+    gdal.VectorTranslate(
+        geojson_lines,
+        input_pbf,
+        format="GeoJSON",
+        layers=["lines"],
+        options=[
+            "-where", sql_where_solar_generator,
+            "-makevalid",
+            "-spat", str(minx), str(miny), str(maxx), str(maxy),
+            "-nlt", "POLYGON",
+        ]
+    )
+
+    gdf_lines = read_vsimem_geojson(geojson_lines)
+    if not gdf_lines.empty:
+        all_solar_gdfs.append(gdf_lines)
+
+    # --- 3. combine ---
+    if not all_solar_gdfs:
+        gdal.Unlink(geojson_poly)
+        gdal.Unlink(geojson_lines)
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    gdf_solar = gpd.GeoDataFrame(
+        pd.concat(all_solar_gdfs, ignore_index=True),
+        crs="EPSG:4326"
+    )
+
+    # Reproject to working CRS
+    gdf_solar = gdf_solar.to_crs(epsg)
+
+    # Cleanup
+    gdal.Unlink(geojson_poly)
+    gdal.Unlink(geojson_lines)
+
+    return gdf_solar
+
+def calculate_azimuth_from_geometry(polygon):
+    """
+    Calculates the azimuth (angle from North, clockwise, 0-180) 
+    of the minimum rotated bounding box for a given Shapely Polygon.
+    """
+    if not polygon or polygon.geom_type not in ['Polygon', 'MultiPolygon']:
+        return 0.0
+
+    min_rect = polygon.minimum_rotated_rectangle
+    
+    if min_rect.geom_type != 'Polygon':
+        return 0.0
+        
+    coords = np.array(min_rect.exterior.coords)
+    
+    segment1 = coords[1] - coords[0]
+    segment2 = coords[2] - coords[1]
+    
+    len1 = np.linalg.norm(segment1)
+    len2 = np.linalg.norm(segment2)
+
+    long_segment = segment1 if len1 >= len2 else segment2
+        
+    if np.linalg.norm(long_segment) == 0:
+        return 0.0
+
+    angle_rad = np.arctan2(long_segment[1], long_segment[0])
+    angle_deg = np.degrees(angle_rad)
+    
+    # Convert angle (from X-axis CCW) to Azimuth (from North CW)
+    azimuth = 90.0 - angle_deg
+    azimuth = azimuth % 360.0
+        
+    # Constrain to 0-180 range
+    if azimuth > 180.0:
+        azimuth -= 180.0
+
+    return azimuth
+
+def _with_solar(gdf_buildings, gdf_solar):
+    """
+    Efficient Dual Join: Performs both building-centric and solar-centric joins
+    in one loop.
+
+    Returns: (gdf_buildings_modified, gdf_solar_modified)
+    """
+
+    n_bld = len(gdf_buildings["geometry"])
+    n_sol = len(gdf_solar["geometry"])
+    
+    # CRITICAL: IDs for both DataFrames
+    BLD_ID_COLUMN = "osm_id"  # Assuming 'osm_id' is the unique ID in the building layer
+    SOLAR_ID_COLUMN = "osm_id"
+    
+    # --- BUILDING-CENTRIC OUTPUT (for blds.df) ---
+    solar_id_lists = [[] for _ in range(n_bld)]  # List of solar IDs for each building
+    solar_m = [[] for _ in range(n_bld)]
+    has_solar = [False] * n_bld
+
+    # --- SOLAR-CENTRIC OUTPUT (for gdf_solar.df) ---
+    bld_id_lists = [[] for _ in range(n_sol)]  # List of building IDs for each solar panel
+    #bld_id_lists =[None] * n_sol
+    
+    # Brute-force intersection
+    for i in range(n_bld):
+        b_geom = gdf_buildings["geometry"].iloc[i]
+        bld_id = gdf_buildings[BLD_ID_COLUMN].iloc[i] # Get the building ID
+
+        for j in range(n_sol):
+            s_geom = gdf_solar["geometry"].iloc[j]
+            sol_id = gdf_solar[SOLAR_ID_COLUMN].iloc[j] # Get the solar ID
+            s_m = gdf_solar['generator:method'].iloc[j] # Get the building ID
+
+            if b_geom.contains(s_geom):
+                # 1. Building-Centric Logic (Attaches solar ID to building)
+                has_solar[i] = True
+                solar_id_lists[i].append(sol_id)
+                solar_m[i].append(s_m)
+
+                # 2. Solar-Centric Logic (Attaches building ID to solar panel)
+                bld_id_lists[j].append(bld_id)
+                #if bld_id_lists[j] is None:
+                #    bld_id_lists[j] = bld_id
+
+    # --- Finalize Lists (Replace [] with None) ---
+    for i in range(n_bld):
+        if not solar_id_lists[i]:
+            solar_id_lists[i] = None
+
+    for j in range(n_sol):
+        if not bld_id_lists[j]:
+            bld_id_lists[j] = None
+
+    # --- CREATE OUTPUT DataFrames ---
+
+    # 1. Modified Building DataFrame (blds)
+    #gdf_blds_out = dict(gdf_buildings)
+    gdf_buildings["children"] = solar_id_lists 
+    gdf_buildings["has_solar"] = has_solar
+    gdf_buildings["method"] = solar_m
+    #blds_out = GeoDataFrameLite(gdf_blds_out)
+    #blds_out.crs = epsg
+
+    # 2. Modified Solar DataFrame (gdf_solar)
+    # We must use the solar DataFrame as the base to keep all geometry/attributes
+    #gdf_solar_out = dict(gdf_solar)
+    # The new column holds the list of intersecting building IDs
+    gdf_solar["parent"] = bld_id_lists 
+    #gdf_solar_out = GeoDataFrameLite(gdf_solar_out)
+    #gdf_solar_out.crs = epsg
+    gdf_solar = gdf_solar.rename(columns={'generator:method': 'method'})
+    gdf_solar['area'] = gdf_solar['geometry'].apply(lambda geom: geom.area)
+    gdf_solar['azimuth'] = gdf_solar['geometry'].apply(calculate_azimuth_from_geometry)
+
+    return gdf_buildings, gdf_solar
+
 def save_to_geopackage(gpkg_path, target_crs_string):
-    # 1. Delete the old file if it exists to avoid locking/append issues
     if os.path.exists(gpkg_path):
         try:
             os.remove(gpkg_path)
             print(f"Cleared existing file: {gpkg_path}")
         except Exception as e:
-            print(f"Could not delete existing file (it may be open in QGIS): {e}")
+            print(f"File locked: {e}")
             return
 
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
     options.destCRS = QgsCoordinateReferenceSystem(target_crs_string)
-    context = QgsCoordinateTransformContext()
     
-    # 2. Iterate and write
-    for i, layer in enumerate(QgsProject.instance().mapLayers().values()):
+    # Use the actual project context to handle CRS transformations correctly
+    context = QgsProject.instance().transformContext()
+    
+    # Flag to track if the GPKG file has been created yet
+    file_created = False
+    
+    for layer in QgsProject.instance().mapLayers().values():
+        # Only process vector layers
         if layer.type() == QgsMapLayer.VectorLayer:
             options.layerName = layer.name().replace(" ", "_").lower()
             
-            # The first layer creates the file, subsequent layers add to it
-            if i == 0:
+            if not file_created:
+                # The first valid vector layer creates the actual .gpkg file
                 options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+                file_created = True
             else:
+                # Every subsequent vector layer adds a new table (layer) to that file
                 options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
             
             error, message = QgsVectorFileWriter.writeAsVectorFormatV2(
@@ -1007,6 +976,6 @@ def save_to_geopackage(gpkg_path, target_crs_string):
             )
             
             if error == QgsVectorFileWriter.NoError:
-                print(f"Exported: {layer.name()}")
+                print(f"✅ Exported: {layer.name()}")
             else:
-                print(f"Failed {layer.name()}: {message}")
+                print(f"❌ Failed {layer.name()}: {message}")
